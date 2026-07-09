@@ -12,6 +12,7 @@ import (
 	nbroute "github.com/netbirdio/netbird/route"
 	"github.com/netbirdio/netbird/shared/management/networkmap"
 	"github.com/netbirdio/netbird/shared/management/proto"
+	log "github.com/sirupsen/logrus"
 )
 
 // wgKeyRawLen is the raw byte length of a WireGuard public key.
@@ -174,31 +175,6 @@ func (e *componentEncoder) appendPeer(p *nbpeer.Peer) uint32 {
 	return idx
 }
 
-func (e *componentEncoder) agentVersionIndex(v string) uint32 {
-	if idx, ok := e.agentVersionOrder[v]; ok {
-		return idx
-	}
-	// Lazy-initialise the table with "" at index 0 so the empty string
-	// stays interchangeable with proto3's default uint32=0 — peers without
-	// a WtVersion don't force the table to materialise.
-	if v == "" {
-		idx := uint32(len(e.agentVersions))
-		if idx == 0 {
-			e.agentVersions = append(e.agentVersions, "")
-		}
-		e.agentVersionOrder[""] = idx
-		return idx
-	}
-	if len(e.agentVersions) == 0 {
-		e.agentVersions = append(e.agentVersions, "")
-		e.agentVersionOrder[""] = 0
-	}
-	idx := uint32(len(e.agentVersions))
-	e.agentVersionOrder[v] = idx
-	e.agentVersions = append(e.agentVersions, v)
-	return idx
-}
-
 // indexRouterPeers ensures every router peer is in the peer dedup table
 // (c.RouterPeers may contain peers not in c.Peers when validation rules drop
 // them) and returns their wire indexes for the RouterPeerIndexes field. Must
@@ -225,6 +201,7 @@ func (e *componentEncoder) encodeGroups() []*proto.GroupCompact {
 	out := make([]*proto.GroupCompact, 0, len(e.components.Groups))
 	for _, g := range e.components.Groups {
 		if !g.HasSeqID() {
+			log.WithField("group id", g.ID).Error("AccountSeqID is not set")
 			continue
 		}
 		peerIdxs := make([]uint32, 0, len(g.Peers))
@@ -255,6 +232,9 @@ func (e *componentEncoder) encodePolicies(policies []*types.Policy) []*proto.Pol
 
 	for _, pol := range policies {
 		if !pol.HasSeqID() || !pol.Enabled {
+			if !pol.HasSeqID() {
+				log.WithField("policy id", pol.ID).Error("AccountSeqID is not set")
+			}
 			continue
 		}
 		for _, r := range pol.Rules {
@@ -352,6 +332,7 @@ func (e *componentEncoder) encodeAuthorizedGroups(m map[string][]string) map[int
 	for groupID, names := range m {
 		seq, ok := e.groupSeq(groupID)
 		if !ok {
+			log.WithField("group id", groupID).Error("unrecognized group or AccountSeqID is not set")
 			continue
 		}
 		out[seq] = &proto.UserNameList{Names: append([]string(nil), names...)}
@@ -398,6 +379,8 @@ func (e *componentEncoder) postureCheckSeqs(xids []string) []int32 {
 	for _, xid := range xids {
 		if seq, ok := e.components.PostureCheckXIDToSeq[xid]; ok {
 			out = append(out, seq)
+		} else {
+			log.WithField("posture check id", xid).Error("unrecognized posture check")
 		}
 	}
 	return out
@@ -427,6 +410,8 @@ func (e *componentEncoder) encodeDNSSettings(s *types.DNSSettings) *proto.DNSSet
 	for _, gid := range s.DisabledManagementGroups {
 		if seq, ok := e.groupSeq(gid); ok {
 			out.DisabledManagementGroupIds = append(out.DisabledManagementGroupIds, seq)
+		} else {
+			log.WithField("group id", gid).Error("unrecognized group or AccountSeqID is not set")
 		}
 	}
 	return out
@@ -478,6 +463,8 @@ func (e *componentEncoder) groupIDsToSeq(groupIDs []string) []int32 {
 	for _, gid := range groupIDs {
 		if seq, ok := e.groupSeq(gid); ok {
 			out = append(out, seq)
+		} else {
+			log.WithField("group id", gid).Error("unrecognized group or AccountSeqID is not set")
 		}
 	}
 	return out
@@ -576,6 +563,8 @@ func (e *componentEncoder) encodeNetworkResources(resources []*resourceTypes.Net
 		}
 		if seq, ok := e.networkSeq(r.NetworkID); ok {
 			entry.NetworkSeq = seq
+		} else {
+			log.WithField("network id", r.NetworkID).Error("unrecognized network resource or AccountSeqID is not set")
 		}
 		if r.Prefix.IsValid() {
 			entry.PrefixCidr = r.Prefix.String()
@@ -596,6 +585,7 @@ func (e *componentEncoder) encodeRoutersMap(routersMap map[string]map[string]*ro
 		}
 		netSeq, ok := e.networkSeq(networkXID)
 		if !ok {
+			log.WithField("network id", networkXID).Error("unrecognized network resource or AccountSeqID is not set")
 			continue
 		}
 		entries := make([]*proto.NetworkRouterEntry, 0, len(routers))
@@ -632,12 +622,16 @@ func (e *componentEncoder) encodeResourcePoliciesMap(rpm map[string][]*types.Pol
 	for _, r := range e.components.NetworkResources {
 		if r != nil && r.AccountSeqID != 0 {
 			resourceXIDToSeq[r.ID] = r.AccountSeqID
+		} else if r.AccountSeqID == 0 {
+			log.WithField("network id", r.ID).Error("AccountSeqID is not set")
+
 		}
 	}
 	out := make(map[int32]*proto.PolicyIds, len(rpm))
 	for resourceXID, policies := range rpm {
 		seq, ok := resourceXIDToSeq[resourceXID]
 		if !ok {
+			log.WithField("network id", resourceXID).Error("unrecognized network resource")
 			continue
 		}
 		ids := make([]int32, 0, len(policies))
@@ -660,6 +654,9 @@ func (e *componentEncoder) encodeGroupIDToUserIDs(m map[string][]string) map[int
 	for groupID, userIDs := range m {
 		seq, ok := e.groupSeq(groupID)
 		if !ok || len(userIDs) == 0 {
+			if !ok {
+				log.WithField("group id", groupID).Error("unrecognized group or AcocuntSeqID is not set")
+			}
 			continue
 		}
 		out[seq] = &proto.UserIDList{UserIds: userIDs}
